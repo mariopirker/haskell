@@ -1,0 +1,225 @@
+module ComputationGraph.Morphism where
+
+import qualified Data.Map as Map 
+import qualified Data.Maybe as Maybe (fromMaybe)
+import qualified Data.List as List 
+import ComputationGraph.StateGraph
+import ComputationGraph.Program
+import ComputationGraph.HeapGraph
+import ComputationGraph.State
+import ComputationGraph.HelperFunctions
+
+{- ############################################################################
+ - ########################### Morphism #######################################
+ - ############################################################################ -}
+
+-- | Representing a node number
+type Nodes = [NodeSG]
+
+-- | Morphism represents a Graph morphism between TermGraph A and
+-- | TermGraph B, and hence indicates a mapping from some nodes of A to 
+-- | some nodes of B
+type Morphism = Map.Map NodeSG NodeSG
+
+--  | Returns the empty Map
+empty :: Morphism
+empty = Map.empty
+
+-- | Extends the Morphism with two Nodes. If Mapping is already in the morphism return the morphismus unchanged.
+-- | Else, add the two nodes to the morphism
+-- | Input: Morphism, Two Nodes 
+-- | Output: Morphism
+extend' :: Morphism -> (NodeSG,NodeSG) -> Morphism
+extend' morphism (n,n') = if(morphism == empty)
+                          then Map.insert n n' morphism
+                          else foldr(\x y-> check x y) morphism (Map.keys morphism)
+                            where check curkey  morph= if((curkey==n) && ((morph Map.! curkey)==n')) 
+                                                       then morph
+                                                       else Map.insert n n' morph
+
+{- ############################################################################
+ - ########################### Calculation Functions ##########################
+ - ############################################################################ -}
+
+-- | Returns the root nodes (dom(Stk) and dom(Loc) of a given state graph).
+-- | Input: StateGraph
+-- | Output: List of nodes that has data constructor StkNode or LocNode
+getRootNodes :: StateGraph -> NodesSG
+getRootNodes s = foldr(\x -> (if (condition x) then (:)x else (++)[])) [] (getNodesSG s)
+ where condition x = (isLocNode x) || (isStkNode x)
+
+-- | Returns the non root nodes of each state graph (that are heapgraph nodes + abstract location nodes)
+-- | These are the Address Nodes of the HeapGraph or NonAddrNodes like Abstract Values
+-- | Input: StateGraph
+-- | Output: List of nodes that has data constructor HeapNode or NAddrNode
+getNotRootNodes :: StateGraph -> NodesSG
+getNotRootNodes s = foldr(\x -> (if (condition x) then (:)x else (++)[])) [] (getNodesSG s)
+  where condition x = (isHeapNode x) || (isNAddrNode x)
+
+-- | Returns all Address Nodes of a StateGraph
+-- | Input: StateGraph
+-- | Output: All Address Nodes. 
+-- | Important: Exploided the fact that the abstract locations are calcualted globally and no longer part
+-- | of heap nodes itself. (have their own data constructor within stategraph nodes).
+getAddressNodes :: StateGraph -> NodesSG 
+getAddressNodes sg = foldr (\x -> (if (isHeapNode x) then (:) x else (++)[])) [] (getNodesSG sg)
+
+-- | Returns all Successors from all addresses in a stategraph. 
+-- | Input: (State, StateGraph)
+-- | Output: Returns a list of all successor nodes for a given Address.
+getHeapNodeSuccs :: (State,StateGraph) -> NodesSG 
+getHeapNodeSuccs  (state,sg) = foldr(\x -> findAndAddSuccessors x) [] addrnodes
+ where addrnodes = getAddressNodes sg 
+       findAndAddSuccessors x = do
+                                  let curnode = x
+                                  let elabel = elabels curnode
+                                  let fta = ftable curnode
+                                  let succs'= foldr (\y -> insert y) [] (elabel)
+                                        where insert y = do
+                                                          let curlabel = getELabel (getNLabelHG y)
+                                                          let ret = if (isAddress (fta Map.! curlabel))
+                                                                    then (HeapNode (AddrNode(getAddVal (fta Map.! curlabel))))
+                                                                    else (HeapNode (NAddrNodeHG (getAbsLocOfAbsLocTuple absLocTuple (HeapPos (getAddrNode (getHeapNode curnode),fst curlabel, snd curlabel)))))
+                                                          (:)ret
+                                  (++) succs'
+       absLocTuple = buildAbsLocTupleSG state
+       ftable node = ft(getObjPair(heap Map.! (getAddrNode (getHeapNode node))))
+       elabels node = getEdgeLabelsFromAddr state node
+       heap = curHeap (getHeaps state)
+
+
+-- | Case Distinction on HeapNode
+caseDistHeapNode (SuccNodeAbsVal s1)="abs"
+caseDistHeapNode (SuccNodeAbsLoc s1)="loc"        
+caseDistHeapNode (AddrNode s1) = "addr"
+caseDistHeapNode _                  ="error"
+
+-- | Generates the Morphism for all Root Nodes (Registers and Stk)
+-- | Input: RootNodes and RootNodes
+generateRootNodesMapping :: NodesSG -> NodesSG -> Morphism
+generateRootNodesMapping nodesSt1 nodesSt2 | (not ( (length nodesSt1) == (length nodesSt2))) = empty
+                                           | otherwise = foldr (\x -> Map.insert (fst x) (snd x)) empty nodes
+ where nodes = zip nodesSt1 nodesSt2
+
+-- | Generates the Morphism for all Address Nodes or Abstract Locations
+generateNotRootNodesMapping :: NodesSG -> NodesSG -> Morphism
+generateNotRootNodesMapping nodesSt1 nodesSt2 | (not ( (length nodesSt1) == (length nodesSt2))) = empty
+                                              | otherwise = foldr (\x -> Map.insert (fst x) (snd x)) empty nodes  
+ where nodes = zip nodesSt1 nodesSt2
+
+-- | Generates the Morphism from all nodes in T to (probably not all) nodes in S
+generateHeapNodeSuccsMapping :: NodesSG -> NodesSG -> Morphism
+generateHeapNodeSuccsMapping nodesSt1 nodesSt2 =foldr (\x y -> getSt2 x y) empty nodesSt1
+ where getSt2 st1node y = foldr (\x -> Map.insert st1node x) y nodesSt2
+
+
+-- | Startpoints                               
+calcMorphism :: Prog -> (State,StateGraph) -> (State,StateGraph) ->  Morphism
+calcMorphism p (stateT,t) (stateS,s) = Map.union (Map.union morph1 morph2) morph3 
+ where rootNodesT = getRootNodes t
+       rootNodesS = getRootNodes s
+       notRootNodesT = getNotRootNodes t
+       notRootNodesS = getNotRootNodes s
+       heapNodeSuccsT = getHeapNodeSuccs (stateT,t)
+       heapNodeSuccsS = getHeapNodeSuccs (stateS,s)
+
+       morph1 = generateRootNodesMapping rootNodesT rootNodesS 
+       morph2 = if(morph1==empty) then empty else (generateNotRootNodesMapping notRootNodesT notRootNodesS)
+       morph3 = if(morph2==empty) then empty else (generateHeapNodeSuccsMapping heapNodeSuccsT heapNodeSuccsS)
+
+
+{- ############################################################################
+ - ########################### Definiton 4.6 checks ###########################
+ - ############################################################################ -}
+
+checkMorphism :: Prog -> (State,StateGraph) -> (State,StateGraph) -> (Bool,Morphism)
+checkMorphism p (stateT,t) (stateS,s) | (m==empty) = (False,empty)
+                                      | otherwise  = (finalResult,m)
+  where m = calcMorphism p (stateT,t) (stateS,s)
+        finalResult = rootResult && nRootResult && hSuccsResult && succsResult && edgesResult
+        -- Point 1
+        rootResult = checkRootNodes m t s
+        -- Point 2
+        nRootResult= if(rootResult == False) then False else checkNotRootNodes m p (stateT,t) (stateS,s)
+        hSuccsResult=if(rootResult == False) then False else checkHeapNodeSuccs m p (stateT,t) (stateS,s)
+        -- Point 3
+        succsResult = if((nRootResult==False)||(hSuccsResult==False)) then False else checkSuccessors m p (stateT,t) (stateS,s)
+        -- Point 4
+        edgesResult = if(succsResult==False) then False else checkEdgeLabels m p (stateT,t) (stateS,s)
+
+-- | Point 1 in the Definiton 4.6
+-- | Input: StateGraph T, StateGraph S
+-- | Output: Morphism
+checkRootNodes :: Morphism -> StateGraph -> StateGraph ->  Bool
+checkRootNodes  m t s = List.and (foldr (\x -> (:)((x == (m Map.! x)) && (sameLabel (t,x) (s,(m Map.! x))))) [] rootNodesT)
+  where rootNodesT = getRootNodes t
+
+-- | Point 2 in the Definition 4.6
+-- | Checks point 2 in the definition for all notes that are not part of dom(stk) and dom(loc). 
+-- | That are the heapgraph nodes + nodes of the abstract locations
+checkNotRootNodes :: Morphism -> Prog -> (State,StateGraph) -> (State,StateGraph) -> Bool
+checkNotRootNodes  m p (stateT,t) (stateS,s) = List.and (foldr (\x -> checkP2 x) [] notRootNodesListT)
+  where checkP2 tnode = (:)(absValBinRel p (extract' stateS s (m Map.! (fst tnode)) absLocTupleS) (snd tnode))
+
+        -- | build up the list that we are iterating over(all notes not elem dom(stk) and dom(loc) -- 
+        notRootNodesT = getNotRootNodes t
+        notRootNodesAbsValT = foldr(\x -> extract stateT t x absLocTupleT) [] notRootNodesT
+        notRootNodesListT = zip notRootNodesT notRootNodesAbsValT
+
+        notRootNodesS = getNotRootNodes s
+        notRootNodesAbsValS = foldr(\x -> extract stateS s x absLocTupleS) [] notRootNodesS
+        notRootNodesListS = zip notRootNodesS notRootNodesAbsValS
+
+        -- | extracts abstract values out of the nodes -- 
+        extract state sg x absloct = case (caseDistNode x) of
+                             "abslocnode"  -> (:)(absValofLoc (getNAddrNodeSG x) absloct)
+                             "heapnode"    -> if((isNLabel (getHeapLabel (mkHeapGraph (getHeaps state)) (getHeapNode x)))==True)
+                                              then (:)(AbsClassVar (getNLabel (getHeapLabel (mkHeapGraph (getHeaps state)) (getHeapNode x))))
+                                              else (:)(getNLabelAbs(getHeapLabel (mkHeapGraph (getHeaps state)) (getHeapNode x)))
+                             _             -> (++)[]
+        absValofLoc x absloct = (foldr(\y -> if((fst y)==x) then (:)(snd y) else (++)[]) [] (Map.elems absloct))!!0
+        getHeapLabel hg node = nlabelHG hg node
+
+        extract' state sg x absloct = case (caseDistNode x) of
+                             "abslocnode"  -> (absValofLoc (getNAddrNodeSG x) absloct)
+                             "heapnode"    -> if((isNLabel (getHeapLabel (mkHeapGraph (getHeaps state)) (getHeapNode x)))==True)
+                                              then (AbsClassVar (getNLabel (getHeapLabel (mkHeapGraph (getHeaps state)) (getHeapNode x))))
+                                              else (getNLabelAbs(getHeapLabel (mkHeapGraph (getHeaps state)) (getHeapNode x)))
+                             _             -> Null
+
+        absLocTupleT = buildAbsLocTupleSG stateT
+        absLocTupleS = buildAbsLocTupleSG stateS
+
+
+
+
+checkHeapNodeSuccs :: Morphism -> Prog -> (State,StateGraph) -> (State,StateGraph) -> Bool
+checkHeapNodeSuccs m p (stateT,t) (stateS,s) = List.and (foldr (\x -> checkP2 x) [] heapNodeSuccsT)
+  where checkP2 node = (:)(absValBinRel p (val (m Map.! node)) (val node)) 
+        heapNodeSuccsT = getHeapNodeSuccs (stateT,t)
+        val node = if (isAddrNode (getHeapNode node))
+                    then AddVal (getAddrNode(getHeapNode node))
+                    else getSuccNodeAbsVal (getHeapNode node)
+
+
+-- | Point 3 in the Definition 4.6 
+-- | Checks point 3 in the definition for all nodes. 
+checkSuccessors :: Morphism -> Prog -> (State,StateGraph) -> (State,StateGraph) -> Bool 
+checkSuccessors m p (stateT,t) (stateS,s) = List.and ((++)rootSuccCheck nrootSuccCheck)
+  where rootSuccCheck = foldr (\x -> succ1Check x) [] rootNodesT
+          where succ1Check x = (:)(((foldr (\y -> (:)(m Map.! y)))[] (nsucc t x)) == (nsucc s (m Map.! x)))
+
+        nrootSuccCheck= foldr (\x -> succ2Check x) [] addressNodesT 
+          where succ2Check x = (:)((foldr (\y -> (:)(m Map.! y))[] (nsucc t x)) == (nsucc s (m Map.! x)))
+       
+        addressNodesT = getAddressNodes t
+        rootNodesT = getRootNodes t
+        
+-- | Point 4 in the Definition 4.6
+-- | Checks point 4 in the definition for all edges
+checkEdgeLabels :: Morphism -> Prog -> (State,StateGraph) -> (State,StateGraph) -> Bool
+checkEdgeLabels m p (stateT,t) (stateS,s) = List.and (foldr (\x -> checkEdges x) [] (Map.keys elabelsT))
+  where checkEdges x  = (:)((elabelsT Map.! x) == (elabelsS Map.! ((m Map.! (fst x)),(m Map.! (snd x)))))
+  
+        elabelsT = getELabelsSG t
+        elabelsS = getELabelsSG s
